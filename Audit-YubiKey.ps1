@@ -58,28 +58,33 @@ function Invoke-Ykman {
   }
 }
 
+# Detecta si tu ykman soporta la opción global --device
+function Test-DeviceSupport {
+  $h = Invoke-Ykman -CmdArgs @("--help")
+  if ($h.ExitCode -ne 0) { return $false }
+  return ($h.StdOut -match "(?m)--device\b")
+}
+
+# Ejecuta una sección, aplicando --device solo si es soportado y no es 'list'
 function Run-Section {
   param(
     [string]$Name,
     [string[]]$CmdArgs,
-    [switch]$NoDeviceOverride   # Úsalo TRUE para comandos como "list"
+    [switch]$NoDeviceOverride   # TRUE para comandos como "list"
   )
-
   if ($null -eq $CmdArgs) { $CmdArgs = @() }
-
-  # No anteponer --device si es un "list" global o se pide explícitamente no hacerlo.
-  $first = if ($CmdArgs.Count -gt 0) { $CmdArgs[0] } else { "" }
-  $isListCmd = ($first -eq "list")
-  $applyDevice = (-not $NoDeviceOverride) -and (-not $isListCmd)
-
-  if ($applyDevice -and $Serial) {
-    $serialClean = Get-SerialDigits $Serial
-    if (-not $serialClean) { throw "El serial especificado no es numérico: '$Serial'." }
-    $CmdArgs = @("--device", $serialClean) + $CmdArgs
-  }
-
   if ($CmdArgs.Count -eq 0) { throw "Run-Section '$Name' fue invocado sin argumentos." }
-  $res = Invoke-Ykman -CmdArgs $CmdArgs
+
+  $first = $CmdArgs[0]
+  $isListCmd = ($first -eq "list")
+
+  $finalArgs = @()
+  if (-not $NoDeviceOverride -and -not $isListCmd -and $script:SupportsDevice -and $script:UseSerial) {
+    $finalArgs += @("--device", $script:UseSerial)
+  }
+  $finalArgs += $CmdArgs
+
+  $res = Invoke-Ykman -CmdArgs $finalArgs
   $ok  = ($res.ExitCode -eq 0)
   [pscustomobject]@{
     name    = $Name
@@ -89,35 +94,45 @@ function Run-Section {
   }
 }
 
-function Probe-LabelFromInfo {
-  param([string]$SerialDigits)
-  $r = Invoke-Ykman -CmdArgs @("--device", $SerialDigits, "info")
-  if ($r.ExitCode -ne 0) { return "[Serial $SerialDigits]" }
+# Cuando no haya --device, intenta etiquetar con 'info' del único dispositivo
+function Probe-LabelFromInfo_NoDevice {
+  $r = Invoke-Ykman -CmdArgs @("info")
+  if ($r.ExitCode -ne 0) { return "(YubiKey)" }
   $lines = $r.StdOut -split "`r?`n"
   $type = ($lines | Where-Object { $_ -match '^(?i)Device type:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
   $fw   = ($lines | Where-Object { $_ -match '^(?i)Firmware version:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
   if ($type -and $fw) { return "$type (fw $fw)" }
   if ($type) { return $type }
-  return "[Serial $SerialDigits]"
+  return "(YubiKey)"
 }
 
 function Build-DeviceListBySerial {
+  # Siempre sin --device
   $serRes = Invoke-Ykman -CmdArgs @("list","--serials")
   if ($serRes.ExitCode -ne 0 -or -not $serRes.StdOut.Trim()) { return @() }
-  $serialsRaw = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
-  $serials = @()
-  foreach ($s in $serialsRaw) {
-    $d = Get-SerialDigits $s
-    if ($d) { $serials += $d }
-  }
-  $devices = @()
+  $serials = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
+  $out = @()
   $i = 1
   foreach ($s in $serials) {
-    $label = Probe-LabelFromInfo -SerialDigits $s
-    $devices += [pscustomobject]@{ Index = $i; Serial = $s; Label = $label }
+    $d = Get-SerialDigits $s
+    if (-not $d) { continue }
+    $label = if ($script:SupportsDevice) {
+      # Si soporta --device podemos pedir info específico
+      $ri = Invoke-Ykman -CmdArgs @("--device", $d, "info")
+      if ($ri.ExitCode -eq 0) {
+        $lines = $ri.StdOut -split "`r?`n"
+        $type = ($lines | Where-Object { $_ -match '^(?i)Device type:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
+        $fw   = ($lines | Where-Object { $_ -match '^(?i)Firmware version:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
+        if ($type -and $fw) { "$type (fw $fw)" } elseif ($type) { $type } else { "[Serial $d]" }
+      } else { "[Serial $d]" }
+    } else {
+      # Sin --device no podemos diferenciar, damos etiqueta genérica
+      Probe-LabelFromInfo_NoDevice
+    }
+    $out += [pscustomobject]@{ Index = $i; Serial = $d; Label = $label }
     $i++
   }
-  return $devices
+  return $out
 }
 
 function Select-YubiKey {
@@ -146,10 +161,10 @@ function Select-YubiKey {
   if ($listRes.ExitCode -ne 0) { throw "No se pudo listar dispositivos: $($listRes.StdErr)" }
   $labels = $listRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
   if ($labels.Count -eq 1) {
-    Write-Warning "La YubiKey no expone serial. Continuaré sin --device; asegúrate de tener SOLO esta YubiKey conectada."
+    Write-Warning "La YubiKey no expone serial o la versión de ykman no lo soporta. Continuaré sin --device; conecta SOLO esta YubiKey."
     return $null
   }
-  throw "No hay seriales disponibles y hay varias YubiKeys conectadas. Desconecta las demás o habilita la visibilidad del serial."
+  throw "No hay seriales disponibles y hay varias YubiKeys conectadas. Desconecta las demás o usa una versión de ykman con soporte de serial."
 }
 
 function Escape-Html { param([string]$Text)
@@ -176,28 +191,38 @@ function Write-SectionConsole {
 # --------------- Inicio ---------------
 try { $script:ykmanPath = Find-Ykman } catch { Write-Error $_; exit 1 }
 
-# Selección de dispositivo
+# Detectar soporte de --device
+$script:SupportsDevice = Test-DeviceSupport
+if (-not $script:SupportsDevice) {
+  Write-Warning "Tu versión de 'ykman' no soporta la opción global --device. Ejecutaré todos los comandos sin --device."
+}
+
+# Selección de dispositivo (si hay serial y soporte se usará; si no, se ignora)
 if (-not $Serial) {
   try {
     $Serial = Select-YubiKey
     if ($Serial) {
       $Serial = Get-SerialDigits $Serial
-      Write-Host "Usando YubiKey con Serial: $Serial`n"
+      Write-Host "Seleccionado serial: $Serial`n"
     } else {
-      Write-Host "Usando YubiKey sin serial (único dispositivo conectado).`n"
+      Write-Host "Sin serial (único dispositivo conectado).`n"
     }
   } catch { Write-Error $_; exit 1 }
 } else {
   $Serial = Get-SerialDigits $Serial
-  if (-not $Serial) { Write-Error "El serial proporcionado no es válido."; exit 1 }
+  if (-not $Serial) { Write-Error "El serial proporcionado no es numérico."; exit 1 }
 }
+
+# Solo usaremos el serial si ykman soporta --device
+$script:UseSerial = $null
+if ($script:SupportsDevice -and $Serial) { $script:UseSerial = $Serial }
 
 $report = [ordered]@{
   meta = [ordered]@{
     generated_at = (Get-Date).ToString("s")
     host         = $env:COMPUTERNAME
     ykman_path   = $script:ykmanPath
-    serial_used  = $Serial
+    serial_used  = $script:UseSerial
     options      = [ordered]@{
       ListFidoResidentCredentials = [bool]$ListFidoResidentCredentials
       ListOathAccounts            = [bool]$ListOathAccounts
@@ -209,7 +234,6 @@ $report = [ordered]@{
 
 # --------- General ----------
 $report.sections += Run-Section -Name "ykman_version"  -CmdArgs @("--version")
-# IMPORTANTE: list NUNCA con --device
 $report.sections += Run-Section -Name "list_devices"   -CmdArgs @("list") -NoDeviceOverride
 $report.sections += Run-Section -Name "device_info"    -CmdArgs @("info")
 
@@ -254,7 +278,7 @@ Write-Host "===== Auditoría YubiKey =====" -ForegroundColor Cyan
 Write-Host ("Equipo: {0}" -f $report.meta.host)
 Write-Host ("ykman:  {0}" -f $report.meta.ykman_path)
 $serialDisplay = $report.meta.serial_used
-if (-not $serialDisplay) { $serialDisplay = "(no disponible)" }
+if (-not $serialDisplay) { $serialDisplay = "(no disponible / no soportado)" }
 Write-Host ("Serie:  {0}" -f $serialDisplay)
 Write-Host ("Fecha:  {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 if ($report.warnings.Count) {
@@ -297,7 +321,7 @@ if ($OutHtml) {
       </style></head><body>'
       $html += '<h1>Informe de auditoría YubiKey</h1>'
       $metaSerial = $report.meta.serial_used
-      if (-not $metaSerial) { $metaSerial = "(no disponible)" }
+      if (-not $metaSerial) { $metaSerial = "(no disponible / no soportado)" }
       $html += ('<div class="meta"><div><strong>Equipo:</strong> {0}</div><div><strong>ykman:</strong> {1}</div><div><strong>Serie:</strong> {2}</div><div><strong>Generado:</strong> {3}</div></div>' -f
         (Escape-Html $report.meta.host),
         (Escape-Html $report.meta.ykman_path),
