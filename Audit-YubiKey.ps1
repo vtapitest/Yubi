@@ -154,9 +154,14 @@ function Escape-Html {
 function Write-SectionConsole {
   param([pscustomobject]$Section)
   $bar = ('-' * 70)
-  $status = if ($Section.ok) { 'OK' } else { 'ERROR' }
+
+  # Precalcular estado y color (sin if inline)
+  $status = 'ERROR'
+  $fg = 'Yellow'
+  if ($Section.ok) { $status = 'OK'; $fg = 'Green' }
+
   Write-Host $bar
-  Write-Host ("[{0}] {1}" -f $status, $Section.name) -ForegroundColor (if ($Section.ok) { 'Green' } else { 'Yellow' })
+  Write-Host ("[{0}] {1}" -f $status, $Section.name) -ForegroundColor $fg
   Write-Host "Comando:"
   Write-Host ("  {0}" -f $Section.command)
   Write-Host "Salida:"
@@ -293,8 +298,11 @@ if ($OutHtml) {
     }
 
     foreach ($s in $report.sections) {
-      $cls = if ($s.ok) { 'ok' } else { 'err' }
-      $html += ('<section><h2 class="{0}">{1} {2}</h2>' -f $cls, (if ($s.ok) { '✅' } else { '⚠️' }), (Escape-Html $s.name))
+      # Precalcular clase e icono (sin if inline)
+      $cls = 'err'; $icon = '⚠️'
+      if ($s.ok) { $cls = 'ok'; $icon = '✅' }
+
+      $html += ('<section><h2 class="{0}">{1} {2}</h2>' -f $cls, $icon, (Escape-Html $s.name))
       $html += '<h3>Comando</h3>'
       $html += ('<pre class="cmd"><code>{0}</code></pre>' -f (Escape-Html $s.command))
       $html += '<h3>Salida</h3>'
