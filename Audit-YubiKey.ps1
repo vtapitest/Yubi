@@ -24,7 +24,7 @@ function Find-Ykman {
 function Get-SerialDigits {
   param([string]$Text)
   if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-  $m = [regex]::Match($Text.Trim(), '\d+')
+  $m = [regex]::Match($Text.Trim(), '^\d+$')
   if ($m.Success) { return $m.Value } else { return $null }
 }
 
@@ -61,14 +61,23 @@ function Invoke-Ykman {
 function Run-Section {
   param(
     [string]$Name,
-    [string[]]$CmdArgs
+    [string[]]$CmdArgs,
+    [switch]$NoDeviceOverride   # Úsalo TRUE para comandos como "list"
   )
+
   if ($null -eq $CmdArgs) { $CmdArgs = @() }
-  if ($Serial) {
+
+  # No anteponer --device si es un "list" global o se pide explícitamente no hacerlo.
+  $first = if ($CmdArgs.Count -gt 0) { $CmdArgs[0] } else { "" }
+  $isListCmd = ($first -eq "list")
+  $applyDevice = (-not $NoDeviceOverride) -and (-not $isListCmd)
+
+  if ($applyDevice -and $Serial) {
     $serialClean = Get-SerialDigits $Serial
     if (-not $serialClean) { throw "El serial especificado no es numérico: '$Serial'." }
     $CmdArgs = @("--device", $serialClean) + $CmdArgs
   }
+
   if ($CmdArgs.Count -eq 0) { throw "Run-Section '$Name' fue invocado sin argumentos." }
   $res = Invoke-Ykman -CmdArgs $CmdArgs
   $ok  = ($res.ExitCode -eq 0)
@@ -199,10 +208,14 @@ $report = [ordered]@{
 }
 
 # --------- General ----------
-$report.sections += Run-Section -Name "ykman_version" -CmdArgs @("--version")
-$report.sections += Run-Section -Name "devices_list"  -CmdArgs @("list")
-$report.sections += Run-Section -Name "device_info"   -CmdArgs @("info")
-$report.sections += Run-Section -Name "config_list"   -CmdArgs @("config","list")
+$report.sections += Run-Section -Name "ykman_version"  -CmdArgs @("--version")
+# IMPORTANTE: list NUNCA con --device
+$report.sections += Run-Section -Name "list_devices"   -CmdArgs @("list") -NoDeviceOverride
+$report.sections += Run-Section -Name "device_info"    -CmdArgs @("info")
+
+# Config list -> usar usb/nfc --list
+$report.sections += Run-Section -Name "config_usb_list" -CmdArgs @("config","usb","--list")
+$report.sections += Run-Section -Name "config_nfc_list" -CmdArgs @("config","nfc","--list")
 
 # --------- FIDO2 ----------
 $report.sections += Run-Section -Name "fido_info" -CmdArgs @("fido","info")
