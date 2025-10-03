@@ -64,7 +64,6 @@ function Run-Section {
     [string[]]$CmdArgs
   )
   if ($null -eq $CmdArgs) { $CmdArgs = @() }
-  # Si tenemos Serial, lo forzamos SIEMPRE limpio y al principio
   if ($Serial) {
     $serialClean = Get-SerialDigits $Serial
     if (-not $serialClean) { throw "El serial especificado no es numérico: '$Serial'." }
@@ -83,7 +82,6 @@ function Run-Section {
 
 function Probe-LabelFromInfo {
   param([string]$SerialDigits)
-  # Obtiene una etiqueta legible a partir de 'ykman --device <serial> info'
   $r = Invoke-Ykman -CmdArgs @("--device", $SerialDigits, "info")
   if ($r.ExitCode -ne 0) { return "[Serial $SerialDigits]" }
   $lines = $r.StdOut -split "`r?`n"
@@ -95,7 +93,6 @@ function Probe-LabelFromInfo {
 }
 
 function Build-DeviceListBySerial {
-  # Devuelve una lista de objetos {Index, Serial, Label} usando SOLO --serials
   $serRes = Invoke-Ykman -CmdArgs @("list","--serials")
   if ($serRes.ExitCode -ne 0 -or -not $serRes.StdOut.Trim()) { return @() }
   $serialsRaw = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
@@ -108,18 +105,13 @@ function Build-DeviceListBySerial {
   $i = 1
   foreach ($s in $serials) {
     $label = Probe-LabelFromInfo -SerialDigits $s
-    $devices += [pscustomobject]@{
-      Index  = $i
-      Serial = $s
-      Label  = $label
-    }
+    $devices += [pscustomobject]@{ Index = $i; Serial = $s; Label = $label }
     $i++
   }
   return $devices
 }
 
 function Select-YubiKey {
-  # Primero intentamos por serial (camino robusto)
   $devices = Build-DeviceListBySerial
   if ($devices.Count -gt 0) {
     if ($devices.Count -eq 1) {
@@ -128,9 +120,7 @@ function Select-YubiKey {
       return $devices[0].Serial
     }
     Write-Host "Dispositivos detectados (por serial):"
-    foreach ($d in $devices) {
-      Write-Host ("  {0}) [Serial: {1}] {2}" -f $d.Index, $d.Serial, $d.Label)
-    }
+    foreach ($d in $devices) { Write-Host ("  {0}) [Serial: {1}] {2}" -f $d.Index, $d.Serial, $d.Label) }
     while ($true) {
       $inp = Read-Host ("Elige 1-{0} (Enter=1)" -f $devices.Count)
       if ([string]::IsNullOrWhiteSpace($inp)) { $inp = "1" }
@@ -142,23 +132,18 @@ function Select-YubiKey {
     }
   }
 
-  # Fallback: no hay seriales (API de serial oculta o llave antigua).
-  # Permitimos continuar SOLO si hay una única llave conectada.
+  # Fallback: sin serial visible, permitir continuar solo con 1 dispositivo conectado
   $listRes = Invoke-Ykman -CmdArgs @("list")
-  if ($listRes.ExitCode -ne 0) {
-    throw "No se pudo listar dispositivos: $($listRes.StdErr)"
-  }
+  if ($listRes.ExitCode -ne 0) { throw "No se pudo listar dispositivos: $($listRes.StdErr)" }
   $labels = $listRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
   if ($labels.Count -eq 1) {
     Write-Warning "La YubiKey no expone serial. Continuaré sin --device; asegúrate de tener SOLO esta YubiKey conectada."
-    return $null  # Sin serial; Run-Section no añadirá --device
+    return $null
   }
-
   throw "No hay seriales disponibles y hay varias YubiKeys conectadas. Desconecta las demás o habilita la visibilidad del serial."
 }
 
-function Escape-Html {
-  param([string]$Text)
+function Escape-Html { param([string]$Text)
   if ($null -eq $Text) { return "" }
   $x = $Text -replace '&','&amp;'
   $x = $x -replace '<','&lt;'
@@ -182,20 +167,17 @@ function Write-SectionConsole {
 # --------------- Inicio ---------------
 try { $script:ykmanPath = Find-Ykman } catch { Write-Error $_; exit 1 }
 
-# Si no se pasó -Serial, pedimos selección interactiva
+# Selección de dispositivo
 if (-not $Serial) {
   try {
     $Serial = Select-YubiKey
     if ($Serial) {
-      $Serial = Get-SerialDigits $Serial  # limpieza final
+      $Serial = Get-SerialDigits $Serial
       Write-Host "Usando YubiKey con Serial: $Serial`n"
     } else {
       Write-Host "Usando YubiKey sin serial (único dispositivo conectado).`n"
     }
-  } catch {
-    Write-Error $_
-    exit 1
-  }
+  } catch { Write-Error $_; exit 1 }
 } else {
   $Serial = Get-SerialDigits $Serial
   if (-not $Serial) { Write-Error "El serial proporcionado no es válido."; exit 1 }
@@ -235,15 +217,13 @@ if ($ListFidoResidentCredentials) {
 }
 
 # --------- PIV ----------
-$report.sections += Run-Section -Name "piv_info"              -CmdArgs @("piv","info")
-$report.sections += Run-Section -Name "piv_list_certificates" -CmdArgs @("piv","list-certificates")
+$report.sections += Run-Section -Name "piv_info" -CmdArgs @("piv","info")
 
 # --------- OpenPGP ----------
 $report.sections += Run-Section -Name "openpgp_info" -CmdArgs @("openpgp","info")
 
 # --------- OTP ----------
 $report.sections += Run-Section -Name "otp_info" -CmdArgs @("otp","info")
-$report.sections += Run-Section -Name "otp_list" -CmdArgs @("otp","list")
 
 # --------- OATH ----------
 $report.sections += Run-Section -Name "oath_info" -CmdArgs @("oath","info")
@@ -260,7 +240,9 @@ Write-Host ""
 Write-Host "===== Auditoría YubiKey =====" -ForegroundColor Cyan
 Write-Host ("Equipo: {0}" -f $report.meta.host)
 Write-Host ("ykman:  {0}" -f $report.meta.ykman_path)
-Write-Host ("Serie:  {0}" -f ($report.meta.serial_used ? $report.meta.serial_used : "(no disponible)"))
+$serialDisplay = $report.meta.serial_used
+if (-not $serialDisplay) { $serialDisplay = "(no disponible)" }
+Write-Host ("Serie:  {0}" -f $serialDisplay)
 Write-Host ("Fecha:  {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 if ($report.warnings.Count) {
   Write-Host "`nAvisos:" -ForegroundColor Yellow
@@ -310,9 +292,7 @@ if ($OutHtml) {
         (Escape-Html ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
       )
       if ($report.warnings.Count) {
-        foreach ($w in $report.warnings) {
-          $html += ('<div class="warn">⚠️ {0}</div>' -f (Escape-Html $w))
-        }
+        foreach ($w in $report.warnings) { $html += ('<div class="warn">⚠️ {0}</div>' -f (Escape-Html $w)) }
       }
       foreach ($s in $report.sections) {
         $cls = 'err'; $icon = '⚠️'
@@ -333,4 +313,3 @@ if ($OutHtml) {
     Write-Warning ("No se pudo escribir HTML en '{0}': {1}" -f $OutHtml, $_.Exception.Message)
   }
 }
-
