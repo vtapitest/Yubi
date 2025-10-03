@@ -19,20 +19,31 @@ function Find-Ykman {
     "$Env:ProgramFiles\Yubico\YubiKey Manager\ykman.exe",
     "${Env:ProgramFiles(x86)}\Yubico\YubiKey Manager\ykman.exe"
   ) | Where-Object { Test-Path $_ }
-  if ($candidatos) { return $candidatos[0] }
+  if ($candidatos -and $candidatos.Count -gt 0) { return $candidatos[0] }
 
   throw "No se encontró 'ykman'. Instala YubiKey Manager CLI o añade la ruta al PATH."
 }
 
 function Invoke-Ykman {
-  param([string[]]$Args)
+  param([string[]]$CmdArgs)
+
+  # Normaliza y filtra nulls
+  if ($null -eq $CmdArgs) { $CmdArgs = @() }
+  $escapedCmdArgs = @()
+  foreach ($a in $CmdArgs) {
+    if ($null -eq $a) { continue }
+    # Escapa comillas
+    $a = $a -replace '"','`"'
+    # Si tiene espacios, lo envolvemos entre comillas
+    if ($a -match '\s') { $escapedCmdArgs += ('"{0}"' -f $a) } else { $escapedCmdArgs += $a }
+  }
+
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $script:ykmanPath
-  $psi.Arguments = [string]::Join(' ', ($Args | ForEach-Object {
-      if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
-  }))
+  # -join tolera arrays vacíos
+  $psi.Arguments = ($escapedCmdArgs -join ' ')
   $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
+  $psi.RedirectStandardError  = $true
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
 
@@ -54,10 +65,14 @@ function Invoke-Ykman {
 function Run-Section {
   param(
     [string]$Name,
-    [string[]]$Args
+    [string[]]$CmdArgs
   )
-  if ($Serial) { $Args = @("--device", $Serial) + $Args }
-  $res = Invoke-Ykman -Args $Args
+  if ($null -eq $CmdArgs) { $CmdArgs = @() }
+  if ($Serial) { $CmdArgs = @("--device", $Serial) + $CmdArgs }
+  if ($CmdArgs.Count -eq 0) {
+    throw "Run-Section '$Name' fue invocado sin argumentos."
+  }
+  $res = Invoke-Ykman -CmdArgs $CmdArgs
   $ok  = ($res.ExitCode -eq 0)
   [pscustomobject]@{
     name    = $Name
@@ -68,33 +83,32 @@ function Run-Section {
 }
 
 function Select-YubiKey {
-  # Obtenemos etiquetas (modelo + interfaces)
-  $listRes = Invoke-Ykman -Args @("list")
+  # Listado de dispositivos (etiquetas)
+  $listRes = Invoke-Ykman -CmdArgs @("list")
   if ($listRes.ExitCode -ne 0) {
     throw "Error en 'ykman list': $($listRes.StdErr)"
   }
-  $labels = $listRes.StdOut -split "`r?`n" | Where-Object { $_.Trim() }
+  $labels = $listRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
 
   if (-not $labels -or $labels.Count -eq 0) {
     throw "No se detectaron YubiKeys conectadas."
   }
 
-  # Intentamos obtener seriales alineados por índice
+  # Seriales por índice
   $serials = @()
-  $serRes = Invoke-Ykman -Args @("list","--serials")
+  $serRes = Invoke-Ykman -CmdArgs @("list","--serials")
   if ($serRes.ExitCode -eq 0 -and $serRes.StdOut.Trim()) {
-    $serials = $serRes.StdOut -split "`r?`n" | Where-Object { $_.Trim() }
+    $serials = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
   } else {
-    # Fallback: intentar extraer 'Serial: 1234567' de cada línea
     foreach ($l in $labels) {
       if ($l -match '(?i)serial[:\s]+(\d{4,})') { $serials += $matches[1] } else { $serials += $null }
     }
   }
 
-  # Emparejar por índice
   $count = [Math]::Min($labels.Count, $serials.Count)
-  $devices = for ($i=0; $i -lt $count; $i++) {
-    [pscustomobject]@{
+  $devices = @()
+  for ($i=0; $i -lt $count; $i++) {
+    $devices += [pscustomobject]@{
       Index  = $i + 1
       Serial = $serials[$i]
       Label  = $labels[$i]
@@ -103,7 +117,8 @@ function Select-YubiKey {
 
   if ($devices.Count -eq 1) {
     Write-Host "Se encontró 1 YubiKey:"
-    Write-Host ("  1) [Serial: {0}] {1}" -f ($devices[0].Serial ?? "desconocido"), $devices[0].Label)
+    $serialDisplay = if ($devices[0].Serial) { $devices[0].Serial } else { "desconocido" }
+    Write-Host ("  1) [Serial: {0}] {1}" -f $serialDisplay, $devices[0].Label)
     if (-not $devices[0].Serial) { throw "No se pudo determinar el serial de la YubiKey." }
     return $devices[0].Serial
   }
@@ -114,7 +129,6 @@ function Select-YubiKey {
     Write-Host ("  {0}) [Serial: {1}] {2}" -f $d.Index, $s, $d.Label)
   }
 
-  # Bucle de selección
   while ($true) {
     $inp = Read-Host ("Elige 1-{0} (Enter=1)" -f $devices.Count)
     if ([string]::IsNullOrWhiteSpace($inp)) { $inp = "1" }
@@ -157,41 +171,41 @@ $report = [ordered]@{
 }
 
 # --------- General ----------
-$report.sections += Run-Section -Name "ykman_version" -Args @("--version")
-$report.sections += Run-Section -Name "devices_list"   -Args @("list")
-$report.sections += Run-Section -Name "device_info"     -Args @("info")
-$report.sections += Run-Section -Name "config_list"     -Args @("config","list")
+$report.sections += Run-Section -Name "ykman_version" -CmdArgs @("--version")
+$report.sections += Run-Section -Name "devices_list"  -CmdArgs @("list")
+$report.sections += Run-Section -Name "device_info"   -CmdArgs @("info")
+$report.sections += Run-Section -Name "config_list"   -CmdArgs @("config","list")
 
 # --------- FIDO2 ----------
-$report.sections += Run-Section -Name "fido_info"       -Args @("fido","info")
+$report.sections += Run-Section -Name "fido_info" -CmdArgs @("fido","info")
 
 if ($ListFidoResidentCredentials) {
   if (-not $FidoPin) {
     $report.warnings += "Se solicitó listar credenciales FIDO2 residentes pero no se proporcionó PIN. Omitiendo para evitar bloqueo interactivo."
   } else {
-    $report.sections += Run-Section -Name "fido_credentials_list" -Args @("fido","credentials","list","--pin",$FidoPin)
+    $report.sections += Run-Section -Name "fido_credentials_list" -CmdArgs @("fido","credentials","list","--pin",$FidoPin)
   }
 } else {
   $report.warnings += "No se listan credenciales FIDO2 residentes (activa -ListFidoResidentCredentials y aporta -FidoPin para incluirlo)."
 }
 
 # --------- PIV ----------
-$report.sections += Run-Section -Name "piv_info"              -Args @("piv","info")
-$report.sections += Run-Section -Name "piv_list_certificates" -Args @("piv","list-certificates")
+$report.sections += Run-Section -Name "piv_info"              -CmdArgs @("piv","info")
+$report.sections += Run-Section -Name "piv_list_certificates" -CmdArgs @("piv","list-certificates")
 
 # --------- OpenPGP ----------
-$report.sections += Run-Section -Name "openpgp_info" -Args @("openpgp","info")
+$report.sections += Run-Section -Name "openpgp_info" -CmdArgs @("openpgp","info")
 
 # --------- OTP ----------
-$report.sections += Run-Section -Name "otp_info"  -Args @("otp","info")
-$report.sections += Run-Section -Name "otp_list"  -Args @("otp","list")
+$report.sections += Run-Section -Name "otp_info" -CmdArgs @("otp","info")
+$report.sections += Run-Section -Name "otp_list" -CmdArgs @("otp","list")
 
 # --------- OATH ----------
-$report.sections += Run-Section -Name "oath_info" -Args @("oath","info")
+$report.sections += Run-Section -Name "oath_info" -CmdArgs @("oath","info")
 if ($ListOathAccounts) {
-  $args = @("oath","accounts","list")
-  if ($OathPassword) { $args += @("--password",$OathPassword) }
-  $report.sections += Run-Section -Name "oath_accounts_list" -Args $args
+  $cmdArgsOath = @("oath","accounts","list")
+  if ($OathPassword) { $cmdArgsOath += @("--password",$OathPassword) }
+  $report.sections += Run-Section -Name "oath_accounts_list" -CmdArgs $cmdArgsOath
 } else {
   $report.warnings += "No se listan cuentas OATH (activa -ListOathAccounts y, si procede, -OathPassword). Puede requerir tocar la YubiKey."
 }
@@ -200,7 +214,11 @@ if ($ListOathAccounts) {
 $jsonPath = "$OutBase.json"
 $mdPath   = "$OutBase.md"
 
+# JSON completo
 $report | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
+
+# Markdown legible (usando 4 backticks como fence)
+$fence = '````'
 
 $md = @()
 $md += "# Informe de auditoría YubiKey"
@@ -212,7 +230,7 @@ $md += "*Serie usada:* $Serial"
 $md += ""
 if ($report.warnings.Count) {
   $md += "## Avisos"
-  $report.warnings | ForEach-Object { $md += "- $_" }
+  foreach ($w in $report.warnings) { $md += "- $w" }
   $md += ""
 }
 $md += "## Secciones"
@@ -222,15 +240,15 @@ foreach ($s in $report.sections) {
   $md += ""
   $md += "**Comando:**"
   $md += ""
-  $md += "```bash"
+  $md += $fence + "bash"
   $md += $s.command
-  $md += "```"
+  $md += $fence
   $md += ""
   $md += "**Salida:**"
   $md += ""
-  $md += "```"
+  $md += $fence
   $md += ($s.output | Out-String).TrimEnd()
-  $md += "```"
+  $md += $fence
   $md += ""
 }
 $md -join "`r`n" | Out-File -FilePath $mdPath -Encoding UTF8
