@@ -11,50 +11,45 @@ param(
 
 # ---------------- Helpers ----------------
 function Find-Ykman {
-  $cmd = Get-Command -Name ykman, ykman.exe -ErrorAction SilentlyContinue |
-         Select-Object -First 1
+  $cmd = Get-Command -Name ykman, ykman.exe -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($cmd) { return $cmd.Path }
-
-  # Fallbacks típicos de instalación en Windows
   $candidatos = @(
     "$Env:ProgramFiles\Yubico\YubiKey Manager\ykman.exe",
     "${Env:ProgramFiles(x86)}\Yubico\YubiKey Manager\ykman.exe"
   ) | Where-Object { Test-Path $_ }
   if ($candidatos -and $candidatos.Count -gt 0) { return $candidatos[0] }
-
   throw "No se encontró 'ykman'. Instala YubiKey Manager CLI o añade la ruta al PATH."
+}
+
+function Get-SerialDigits {
+  param([string]$Text)
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  $m = [regex]::Match($Text.Trim(), '\d+')
+  if ($m.Success) { return $m.Value } else { return $null }
 }
 
 function Invoke-Ykman {
   param([string[]]$CmdArgs)
-
-  # Normaliza y filtra nulls
   if ($null -eq $CmdArgs) { $CmdArgs = @() }
   $escapedCmdArgs = @()
   foreach ($a in $CmdArgs) {
     if ($null -eq $a) { continue }
-    # Escapa comillas
     $a = $a -replace '"','`"'
-    # Si tiene espacios, lo envolvemos entre comillas
     if ($a -match '\s') { $escapedCmdArgs += ('"{0}"' -f $a) } else { $escapedCmdArgs += $a }
   }
-
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $script:ykmanPath
-  # -join tolera arrays vacíos
   $psi.Arguments = ($escapedCmdArgs -join ' ')
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
-
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
   [void]$p.Start()
   $stdout = $p.StandardOutput.ReadToEnd()
   $stderr = $p.StandardError.ReadToEnd()
   $p.WaitForExit()
-
   [pscustomobject]@{
     ExitCode = $p.ExitCode
     StdOut   = $stdout.Trim()
@@ -69,10 +64,13 @@ function Run-Section {
     [string[]]$CmdArgs
   )
   if ($null -eq $CmdArgs) { $CmdArgs = @() }
-  if ($Serial) { $CmdArgs = @("--device", $Serial) + $CmdArgs }
-  if ($CmdArgs.Count -eq 0) {
-    throw "Run-Section '$Name' fue invocado sin argumentos."
+  # Si tenemos Serial, lo forzamos SIEMPRE limpio y al principio
+  if ($Serial) {
+    $serialClean = Get-SerialDigits $Serial
+    if (-not $serialClean) { throw "El serial especificado no es numérico: '$Serial'." }
+    $CmdArgs = @("--device", $serialClean) + $CmdArgs
   }
+  if ($CmdArgs.Count -eq 0) { throw "Run-Section '$Name' fue invocado sin argumentos." }
   $res = Invoke-Ykman -CmdArgs $CmdArgs
   $ok  = ($res.ExitCode -eq 0)
   [pscustomobject]@{
@@ -83,63 +81,80 @@ function Run-Section {
   }
 }
 
+function Probe-LabelFromInfo {
+  param([string]$SerialDigits)
+  # Obtiene una etiqueta legible a partir de 'ykman --device <serial> info'
+  $r = Invoke-Ykman -CmdArgs @("--device", $SerialDigits, "info")
+  if ($r.ExitCode -ne 0) { return "[Serial $SerialDigits]" }
+  $lines = $r.StdOut -split "`r?`n"
+  $type = ($lines | Where-Object { $_ -match '^(?i)Device type:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
+  $fw   = ($lines | Where-Object { $_ -match '^(?i)Firmware version:\s*(.+)$' } | ForEach-Object { $matches[1].Trim() } | Select-Object -First 1)
+  if ($type -and $fw) { return "$type (fw $fw)" }
+  if ($type) { return $type }
+  return "[Serial $SerialDigits]"
+}
+
+function Build-DeviceListBySerial {
+  # Devuelve una lista de objetos {Index, Serial, Label} usando SOLO --serials
+  $serRes = Invoke-Ykman -CmdArgs @("list","--serials")
+  if ($serRes.ExitCode -ne 0 -or -not $serRes.StdOut.Trim()) { return @() }
+  $serialsRaw = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
+  $serials = @()
+  foreach ($s in $serialsRaw) {
+    $d = Get-SerialDigits $s
+    if ($d) { $serials += $d }
+  }
+  $devices = @()
+  $i = 1
+  foreach ($s in $serials) {
+    $label = Probe-LabelFromInfo -SerialDigits $s
+    $devices += [pscustomobject]@{
+      Index  = $i
+      Serial = $s
+      Label  = $label
+    }
+    $i++
+  }
+  return $devices
+}
+
 function Select-YubiKey {
-  # Listado de dispositivos (etiquetas)
+  # Primero intentamos por serial (camino robusto)
+  $devices = Build-DeviceListBySerial
+  if ($devices.Count -gt 0) {
+    if ($devices.Count -eq 1) {
+      Write-Host "Se encontró 1 YubiKey:"
+      Write-Host ("  1) [Serial: {0}] {1}" -f $devices[0].Serial, $devices[0].Label)
+      return $devices[0].Serial
+    }
+    Write-Host "Dispositivos detectados (por serial):"
+    foreach ($d in $devices) {
+      Write-Host ("  {0}) [Serial: {1}] {2}" -f $d.Index, $d.Serial, $d.Label)
+    }
+    while ($true) {
+      $inp = Read-Host ("Elige 1-{0} (Enter=1)" -f $devices.Count)
+      if ([string]::IsNullOrWhiteSpace($inp)) { $inp = "1" }
+      if ($inp -as [int] -and [int]$inp -ge 1 -and [int]$inp -le $devices.Count) {
+        $choice = $devices[[int]$inp - 1]
+        return $choice.Serial
+      }
+      Write-Host "Selección no válida. Intenta de nuevo."
+    }
+  }
+
+  # Fallback: no hay seriales (API de serial oculta o llave antigua).
+  # Permitimos continuar SOLO si hay una única llave conectada.
   $listRes = Invoke-Ykman -CmdArgs @("list")
   if ($listRes.ExitCode -ne 0) {
-    throw "Error en 'ykman list': $($listRes.StdErr)"
+    throw "No se pudo listar dispositivos: $($listRes.StdErr)"
   }
   $labels = $listRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
-
-  if (-not $labels -or $labels.Count -eq 0) {
-    throw "No se detectaron YubiKeys conectadas."
+  if ($labels.Count -eq 1) {
+    Write-Warning "La YubiKey no expone serial. Continuaré sin --device; asegúrate de tener SOLO esta YubiKey conectada."
+    return $null  # Sin serial; Run-Section no añadirá --device
   }
 
-  # Seriales por índice
-  $serials = @()
-  $serRes = Invoke-Ykman -CmdArgs @("list","--serials")
-  if ($serRes.ExitCode -eq 0 -and $serRes.StdOut.Trim()) {
-    $serials = $serRes.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() }
-  } else {
-    foreach ($l in $labels) {
-      if ($l -match '(?i)serial[:\s]+(\d{4,})') { $serials += $matches[1] } else { $serials += $null }
-    }
-  }
-
-  $count = [Math]::Min($labels.Count, $serials.Count)
-  $devices = @()
-  for ($i=0; $i -lt $count; $i++) {
-    $devices += [pscustomobject]@{
-      Index  = $i + 1
-      Serial = $serials[$i]
-      Label  = $labels[$i]
-    }
-  }
-
-  if ($devices.Count -eq 1) {
-    Write-Host "Se encontró 1 YubiKey:"
-    $serialDisplay = if ($devices[0].Serial) { $devices[0].Serial } else { "desconocido" }
-    Write-Host ("  1) [Serial: {0}] {1}" -f $serialDisplay, $devices[0].Label)
-    if (-not $devices[0].Serial) { throw "No se pudo determinar el serial de la YubiKey." }
-    return $devices[0].Serial
-  }
-
-  Write-Host "Dispositivos detectados:"
-  foreach ($d in $devices) {
-    $s = if ($d.Serial) { $d.Serial } else { "desconocido" }
-    Write-Host ("  {0}) [Serial: {1}] {2}" -f $d.Index, $s, $d.Label)
-  }
-
-  while ($true) {
-    $inp = Read-Host ("Elige 1-{0} (Enter=1)" -f $devices.Count)
-    if ([string]::IsNullOrWhiteSpace($inp)) { $inp = "1" }
-    if ($inp -as [int] -and [int]$inp -ge 1 -and [int]$inp -le $devices.Count) {
-      $choice = $devices[[int]$inp - 1]
-      if (-not $choice.Serial) { throw "No se pudo determinar el serial del dispositivo seleccionado." }
-      return $choice.Serial
-    }
-    Write-Host "Selección no válida. Intenta de nuevo."
-  }
+  throw "No hay seriales disponibles y hay varias YubiKeys conectadas. Desconecta las demás o habilita la visibilidad del serial."
 }
 
 function Escape-Html {
@@ -154,12 +169,8 @@ function Escape-Html {
 function Write-SectionConsole {
   param([pscustomobject]$Section)
   $bar = ('-' * 70)
-
-  # Precalcular estado y color (sin if inline)
-  $status = 'ERROR'
-  $fg = 'Yellow'
+  $status = 'ERROR'; $fg = 'Yellow'
   if ($Section.ok) { $status = 'OK'; $fg = 'Green' }
-
   Write-Host $bar
   Write-Host ("[{0}] {1}" -f $status, $Section.name) -ForegroundColor $fg
   Write-Host "Comando:"
@@ -175,11 +186,19 @@ try { $script:ykmanPath = Find-Ykman } catch { Write-Error $_; exit 1 }
 if (-not $Serial) {
   try {
     $Serial = Select-YubiKey
-    Write-Host "Usando YubiKey con Serial: $Serial`n"
+    if ($Serial) {
+      $Serial = Get-SerialDigits $Serial  # limpieza final
+      Write-Host "Usando YubiKey con Serial: $Serial`n"
+    } else {
+      Write-Host "Usando YubiKey sin serial (único dispositivo conectado).`n"
+    }
   } catch {
     Write-Error $_
     exit 1
   }
+} else {
+  $Serial = Get-SerialDigits $Serial
+  if (-not $Serial) { Write-Error "El serial proporcionado no es válido."; exit 1 }
 }
 
 $report = [ordered]@{
@@ -205,7 +224,6 @@ $report.sections += Run-Section -Name "config_list"   -CmdArgs @("config","list"
 
 # --------- FIDO2 ----------
 $report.sections += Run-Section -Name "fido_info" -CmdArgs @("fido","info")
-
 if ($ListFidoResidentCredentials) {
   if (-not $FidoPin) {
     $report.warnings += "Se solicitó listar credenciales FIDO2 residentes pero no se proporcionó PIN. Omitiendo para evitar bloqueo interactivo."
@@ -242,17 +260,14 @@ Write-Host ""
 Write-Host "===== Auditoría YubiKey =====" -ForegroundColor Cyan
 Write-Host ("Equipo: {0}" -f $report.meta.host)
 Write-Host ("ykman:  {0}" -f $report.meta.ykman_path)
-Write-Host ("Serie:  {0}" -f $report.meta.serial_used)
+Write-Host ("Serie:  {0}" -f ($report.meta.serial_used ? $report.meta.serial_used : "(no disponible)"))
 Write-Host ("Fecha:  {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 if ($report.warnings.Count) {
   Write-Host "`nAvisos:" -ForegroundColor Yellow
   foreach ($w in $report.warnings) { Write-Host (" - {0}" -f $w) -ForegroundColor Yellow }
 }
 Write-Host ""
-
-foreach ($s in $report.sections) {
-  Write-SectionConsole -Section $s
-}
+foreach ($s in $report.sections) { Write-SectionConsole -Section $s }
 Write-Host ('-' * 70)
 
 # --------- Exportaciones opcionales ---------
@@ -267,53 +282,55 @@ if ($OutJson) {
 
 if ($OutHtml) {
   try {
-    $html = @()
-    $html += '<!doctype html>'
-    $html += '<html lang="es"><head><meta charset="utf-8">'
-    $html += '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    $html += '<title>Informe YubiKey</title>'
-    $html += '<style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;background:#0b0f14;color:#e6edf3;margin:2rem;}
-      h1,h2,h3{color:#fff}
-      .meta{margin-bottom:1rem;opacity:.9}
-      .warn{background:#583b00;color:#ffd78e;padding:.5rem .75rem;border-radius:.5rem;margin:.5rem 0}
-      section{background:#0f1720;border:1px solid #1f2a37;border-radius:.75rem;margin:1rem 0;padding:1rem}
-      .ok{color:#22c55e} .err{color:#f59e0b}
-      pre{background:#0b1220;border:1px solid #1f2a37;padding:1rem;border-radius:.5rem;overflow:auto}
-      code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-      .cmd{opacity:.9}
-    </style></head><body>'
-    $html += '<h1>Informe de auditoría YubiKey</h1>'
-    $html += ('<div class="meta"><div><strong>Equipo:</strong> {0}</div><div><strong>ykman:</strong> {1}</div><div><strong>Serie:</strong> {2}</div><div><strong>Generado:</strong> {3}</div></div>' -f
-      (Escape-Html $report.meta.host),
-      (Escape-Html $report.meta.ykman_path),
-      (Escape-Html $report.meta.serial_used),
-      (Escape-Html ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
-    )
-
-    if ($report.warnings.Count) {
-      foreach ($w in $report.warnings) {
-        $html += ('<div class="warn">⚠️ {0}</div>' -f (Escape-Html $w))
+    function HTML-Report {
+      param($report)
+      $html = @()
+      $html += '<!doctype html>'
+      $html += '<html lang="es"><head><meta charset="utf-8">'
+      $html += '<meta name="viewport" content="width=device-width, initial-scale=1">'
+      $html += '<title>Informe YubiKey</title>'
+      $html += '<style>
+        body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;background:#0b0f14;color:#e6edf3;margin:2rem;}
+        h1,h2,h3{color:#fff}
+        .meta{margin-bottom:1rem;opacity:.9}
+        .warn{background:#583b00;color:#ffd78e;padding:.5rem .75rem;border-radius:.5rem;margin:.5rem 0}
+        section{background:#0f1720;border:1px solid #1f2a37;border-radius:.75rem;margin:1rem 0;padding:1rem}
+        .ok{color:#22c55e} .err{color:#f59e0b}
+        pre{background:#0b1220;border:1px solid #1f2a37;padding:1rem;border-radius:.5rem;overflow:auto}
+        code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+        .cmd{opacity:.9}
+      </style></head><body>'
+      $html += '<h1>Informe de auditoría YubiKey</h1>'
+      $metaSerial = $report.meta.serial_used
+      if (-not $metaSerial) { $metaSerial = "(no disponible)" }
+      $html += ('<div class="meta"><div><strong>Equipo:</strong> {0}</div><div><strong>ykman:</strong> {1}</div><div><strong>Serie:</strong> {2}</div><div><strong>Generado:</strong> {3}</div></div>' -f
+        (Escape-Html $report.meta.host),
+        (Escape-Html $report.meta.ykman_path),
+        (Escape-Html $metaSerial),
+        (Escape-Html ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+      )
+      if ($report.warnings.Count) {
+        foreach ($w in $report.warnings) {
+          $html += ('<div class="warn">⚠️ {0}</div>' -f (Escape-Html $w))
+        }
       }
+      foreach ($s in $report.sections) {
+        $cls = 'err'; $icon = '⚠️'
+        if ($s.ok) { $cls = 'ok'; $icon = '✅' }
+        $html += ('<section><h2 class="{0}">{1} {2}</h2>' -f $cls, $icon, (Escape-Html $s.name))
+        $html += '<h3>Comando</h3>'
+        $html += ('<pre class="cmd"><code>{0}</code></pre>' -f (Escape-Html $s.command))
+        $html += '<h3>Salida</h3>'
+        $html += ('<pre><code>{0}</code></pre>' -f (Escape-Html $s.output))
+        $html += '</section>'
+      }
+      $html += '</body></html>'
+      return ($html -join "`r`n")
     }
-
-    foreach ($s in $report.sections) {
-      # Precalcular clase e icono (sin if inline)
-      $cls = 'err'; $icon = '⚠️'
-      if ($s.ok) { $cls = 'ok'; $icon = '✅' }
-
-      $html += ('<section><h2 class="{0}">{1} {2}</h2>' -f $cls, $icon, (Escape-Html $s.name))
-      $html += '<h3>Comando</h3>'
-      $html += ('<pre class="cmd"><code>{0}</code></pre>' -f (Escape-Html $s.command))
-      $html += '<h3>Salida</h3>'
-      $html += ('<pre><code>{0}</code></pre>' -f (Escape-Html $s.output))
-      $html += '</section>'
-    }
-
-    $html += '</body></html>'
-    $html -join "`r`n" | Out-File -FilePath $OutHtml -Encoding UTF8
+    (HTML-Report -report $report) | Out-File -FilePath $OutHtml -Encoding UTF8
     Write-Host ("HTML guardado en: {0}" -f $OutHtml) -ForegroundColor Green
   } catch {
     Write-Warning ("No se pudo escribir HTML en '{0}': {1}" -f $OutHtml, $_.Exception.Message)
   }
 }
+
