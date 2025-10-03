@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
   [string]$Serial,                              # Nº de serie (si no lo pasas, te pedirá elegir)
-  [string]$OutBase = "yubikey_audit_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"),
   [switch]$ListFidoResidentCredentials,         # Incluye credenciales FIDO2 residentes (requiere PIN)
   [string]$FidoPin,                             # PIN FIDO2 si activas la opción anterior
   [switch]$ListOathAccounts,                    # Incluye cuentas OATH (puede requerir toque / password)
-  [string]$OathPassword                         # Contraseña OATH si procede
+  [string]$OathPassword,                        # Contraseña OATH si procede
+  [string]$OutHtml,                             # Ruta de salida HTML opcional (p.ej. .\informe.html)
+  [string]$OutJson                              # Ruta de salida JSON opcional
 )
 
 # ---------------- Helpers ----------------
@@ -141,6 +142,27 @@ function Select-YubiKey {
   }
 }
 
+function Escape-Html {
+  param([string]$Text)
+  if ($null -eq $Text) { return "" }
+  $x = $Text -replace '&','&amp;'
+  $x = $x -replace '<','&lt;'
+  $x = $x -replace '>','&gt;'
+  return $x
+}
+
+function Write-SectionConsole {
+  param([pscustomobject]$Section)
+  $bar = ('-' * 70)
+  $status = if ($Section.ok) { 'OK' } else { 'ERROR' }
+  Write-Host $bar
+  Write-Host ("[{0}] {1}" -f $status, $Section.name) -ForegroundColor (if ($Section.ok) { 'Green' } else { 'Yellow' })
+  Write-Host "Comando:"
+  Write-Host ("  {0}" -f $Section.command)
+  Write-Host "Salida:"
+  Write-Host ($Section.output)
+}
+
 # --------------- Inicio ---------------
 try { $script:ykmanPath = Find-Ykman } catch { Write-Error $_; exit 1 }
 
@@ -210,49 +232,80 @@ if ($ListOathAccounts) {
   $report.warnings += "No se listan cuentas OATH (activa -ListOathAccounts y, si procede, -OathPassword). Puede requerir tocar la YubiKey."
 }
 
-# --------- Guardar archivos ----------
-$jsonPath = "$OutBase.json"
-$mdPath   = "$OutBase.md"
-
-# JSON completo
-$report | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonPath -Encoding UTF8
-
-# Markdown legible (usando 4 backticks como fence)
-$fence = '````'
-
-$md = @()
-$md += "# Informe de auditoría YubiKey"
-$md += ""
-$md += "*Generado:* $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-$md += "*Equipo:* $($report.meta.host)"
-$md += "*ykman:* $($report.meta.ykman_path)"
-$md += "*Serie usada:* $Serial"
-$md += ""
+# --------- Salida por CONSOLA ---------
+Write-Host ""
+Write-Host "===== Auditoría YubiKey =====" -ForegroundColor Cyan
+Write-Host ("Equipo: {0}" -f $report.meta.host)
+Write-Host ("ykman:  {0}" -f $report.meta.ykman_path)
+Write-Host ("Serie:  {0}" -f $report.meta.serial_used)
+Write-Host ("Fecha:  {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 if ($report.warnings.Count) {
-  $md += "## Avisos"
-  foreach ($w in $report.warnings) { $md += "- $w" }
-  $md += ""
+  Write-Host "`nAvisos:" -ForegroundColor Yellow
+  foreach ($w in $report.warnings) { Write-Host (" - {0}" -f $w) -ForegroundColor Yellow }
 }
-$md += "## Secciones"
-foreach ($s in $report.sections) {
-  $status = if ($s.ok) { "✅" } else { "⚠️" }
-  $md += "### $status $($s.name)"
-  $md += ""
-  $md += "**Comando:**"
-  $md += ""
-  $md += $fence + "bash"
-  $md += $s.command
-  $md += $fence
-  $md += ""
-  $md += "**Salida:**"
-  $md += ""
-  $md += $fence
-  $md += ($s.output | Out-String).TrimEnd()
-  $md += $fence
-  $md += ""
-}
-$md -join "`r`n" | Out-File -FilePath $mdPath -Encoding UTF8
+Write-Host ""
 
-Write-Host "`nListo."
-Write-Host "JSON:    $jsonPath"
-Write-Host "Markdown:$mdPath`n"
+foreach ($s in $report.sections) {
+  Write-SectionConsole -Section $s
+}
+Write-Host ('-' * 70)
+
+# --------- Exportaciones opcionales ---------
+if ($OutJson) {
+  try {
+    $report | ConvertTo-Json -Depth 8 | Out-File -FilePath $OutJson -Encoding UTF8
+    Write-Host ("JSON guardado en: {0}" -f $OutJson) -ForegroundColor Green
+  } catch {
+    Write-Warning ("No se pudo escribir JSON en '{0}': {1}" -f $OutJson, $_.Exception.Message)
+  }
+}
+
+if ($OutHtml) {
+  try {
+    $html = @()
+    $html += '<!doctype html>'
+    $html += '<html lang="es"><head><meta charset="utf-8">'
+    $html += '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    $html += '<title>Informe YubiKey</title>'
+    $html += '<style>
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;background:#0b0f14;color:#e6edf3;margin:2rem;}
+      h1,h2,h3{color:#fff}
+      .meta{margin-bottom:1rem;opacity:.9}
+      .warn{background:#583b00;color:#ffd78e;padding:.5rem .75rem;border-radius:.5rem;margin:.5rem 0}
+      section{background:#0f1720;border:1px solid #1f2a37;border-radius:.75rem;margin:1rem 0;padding:1rem}
+      .ok{color:#22c55e} .err{color:#f59e0b}
+      pre{background:#0b1220;border:1px solid #1f2a37;padding:1rem;border-radius:.5rem;overflow:auto}
+      code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+      .cmd{opacity:.9}
+    </style></head><body>'
+    $html += '<h1>Informe de auditoría YubiKey</h1>'
+    $html += ('<div class="meta"><div><strong>Equipo:</strong> {0}</div><div><strong>ykman:</strong> {1}</div><div><strong>Serie:</strong> {2}</div><div><strong>Generado:</strong> {3}</div></div>' -f
+      (Escape-Html $report.meta.host),
+      (Escape-Html $report.meta.ykman_path),
+      (Escape-Html $report.meta.serial_used),
+      (Escape-Html ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+    )
+
+    if ($report.warnings.Count) {
+      foreach ($w in $report.warnings) {
+        $html += ('<div class="warn">⚠️ {0}</div>' -f (Escape-Html $w))
+      }
+    }
+
+    foreach ($s in $report.sections) {
+      $cls = if ($s.ok) { 'ok' } else { 'err' }
+      $html += ('<section><h2 class="{0}">{1} {2}</h2>' -f $cls, (if ($s.ok) { '✅' } else { '⚠️' }), (Escape-Html $s.name))
+      $html += '<h3>Comando</h3>'
+      $html += ('<pre class="cmd"><code>{0}</code></pre>' -f (Escape-Html $s.command))
+      $html += '<h3>Salida</h3>'
+      $html += ('<pre><code>{0}</code></pre>' -f (Escape-Html $s.output))
+      $html += '</section>'
+    }
+
+    $html += '</body></html>'
+    $html -join "`r`n" | Out-File -FilePath $OutHtml -Encoding UTF8
+    Write-Host ("HTML guardado en: {0}" -f $OutHtml) -ForegroundColor Green
+  } catch {
+    Write-Warning ("No se pudo escribir HTML en '{0}': {1}" -f $OutHtml, $_.Exception.Message)
+  }
+}
